@@ -1,0 +1,1077 @@
+---
+title: "PFAS and Eicosanoids"
+output: html_notebook
+---
+
+This notebook will include analysis related to PFAS and Eicosanoids in both PROTECT only
+
+### Import data 
+
+Load some libraries
+
+```{r loading libraries}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(naniar)
+library(corrplot)
+library(patchwork)
+library(ggpubr)
+library(pheatmap)
+library(forcats)
+library(kableExtra)
+library(flextable)
+
+
+```
+
+Import some data files 
+
+```{r import files}
+
+lod_eic <- read.csv("lod_eic_updated.csv") %>% select(analyte,  analyte_format, LOD)
+
+pfas_eic_combined <- read.csv("pfas_eic_pr_lc_comb.csv", check.names = FALSE)[,-1] 
+covars_pr <- read.csv("covars_pr.csv")%>% 
+  select(-X) 
+eic_class <- read.csv("eic_class2.csv") %>% 
+  select(-X)
+
+names(eic_class) <- c("vars", "group")
+# eic_class$vars <- tolower(eic_class$vars)
+
+# PFAS concentration columns
+exposures_all<- grep("^conc_", names(pfas_eic_combined), value = TRUE)
+exposures_short <- c("conc_pfoa", "conc_pfos", "conc_pfhxs", "conc_pfna")
+
+
+covars_list <- c("age", "bmi_prepreg", "as.factor(mat_edu_cat)", "as.factor(ins_cat)", "race4b", "nullip", "as.factor(cohort)")
+covars_list0 <- c("age", "bmi_prepreg", "mat_edu_cat", "ins_cat", "race4b", "nullip", "cohort")
+
+covars_list_pr <- c("age", "bmi_prepreg", "as.factor(mat_edu_cat)", "as.factor(ins_cat)", "nullip", "year_t1")
+
+
+#Two eicosanoids ltc4.me and lte4 have 0 as minimim values. This will cause an error for these eicosanoids later on
+
+pfas_eic_combined <- pfas_eic_combined %>%
+  mutate(`Leukotriene E4` = ifelse(`Leukotriene E4` == 0, NA, `Leukotriene E4`),
+         `Leukotriene C4 methyl ester` = ifelse(`Leukotriene C4 methyl ester` == 0, NA, `Leukotriene C4 methyl ester`))
+
+eic_all <- names(pfas_eic_combined[,21:75])
+
+covars_lc_pr <- read.csv("covars_pr_lc_comb.csv") %>% select(-X)
+
+
+pfas_eic_combined2 <- pfas_eic_combined %>% 
+  inner_join(covars_lc_pr, by = c("cohort", "id")) %>% 
+  distinct()
+
+# eic_all2 <- setdiff(eic_all, c("dipge2", "dipgj2")) #thi was done before because LC cohort doesnt have these compounds. Not necessary for PR
+
+eic_all2 <- eic_all
+
+#Add third visit ga
+tvdate_ga <- read.csv("thirdvisitdate.csv") %>% 
+  select(-"X") %>% distinct()
+
+pfas_eic_combined2 <- pfas_eic_combined2 %>% 
+  left_join(tvdate_ga, by = c("cohort", "id")) 
+
+pfas_eic_pr <- pfas_eic_combined2 %>% filter(cohort == "PR")  
+
+pfas_eic_pr <- pfas_eic_pr %>% distinct()
+
+chk <- pfas_eic_pr %>% filter(id == 2) 
+
+```
+
+Recode some variables 
+
+```{r recode some variables now}
+
+pfas_eic_pr <- pfas_eic_pr %>%
+  mutate(
+    age_group = ifelse(age <= median(age, na.rm = TRUE), "Below Median", "Above Median"),
+    bmi_group = case_when(
+      bmi_prepreg <= 25 ~ "BMI <= 25",
+      bmi_prepreg > 25 & bmi_prepreg <= 30 ~ "25 < BMI <= 30",
+      bmi_prepreg > 30 ~ "BMI > 30")
+  )
+
+#Recode year
+pfas_eic_pr <- pfas_eic_pr %>%
+  mutate(year_t1b = ifelse(
+    year_t1 %in% 2011:2015, 2015, year_t1)#3 years
+  )
+
+pfas_eic_pr <- pfas_eic_pr %>% distinct()
+
+```
+
+
+### Demographic table - Table 1 for manuscript
+
+I will create demographic table here. This will be table 1 for manuscript. 
+
+```{r creating demographic table for manuscript}
+
+table_output_overall <- table1::table1(~ age + 
+                                         bmi_prepreg + 
+                                         ga_samp +
+                                         ga_t3 +
+                                         as.factor(mat_edu_cat) +
+                                         as.factor(ins_cat) + 
+                                         as.factor(nullip) +
+                                         as.factor(smpregb) +
+                                         as.factor(year_t1b),
+                                       data = pfas_eic_pr)
+print(table_output_overall)
+
+table_output_overall_flex <- table1::t1flex(table_output_overall)
+save_as_docx(table_output_overall_flex, path = "C:/Users/rsiwa/OneDrive/Michigan_course/eicosanoids//table1_overall.docx")
+
+
+```
+
+
+### Distributions of PFAS by cohorts 
+
+First we will look at the distributions of PFAS concentrations in the study participants by cohort
+
+```{r distribution of PFAS by cohort}
+
+pfas_summary_results <- lapply(exposures_all, function(col) {
+  pfas_col_summary(pfas_eic_pr, col)
+}) %>%
+  bind_rows() %>%
+  select(PFAS, everything()) %>%
+  arrange(desc(Detection_Rate)) %>%
+  mutate(MedQ1Q3 = paste0(Median, " (", Q1, ", ", Q3, ")"))
+
+# Print results
+print(pfas_summary_results)
+
+# Optional: Save to CSV
+write.csv(pfas_summary_results, "pfas_conc_summary_PR.csv", row.names = FALSE)
+
+```
+
+We have 4 PFAS with detection rate above 50% in PR: PFNA, PFHxS, PFOA, and PFOS
+
+Focus on these 4 PFAS for now
+
+```{r correlation between PFAS}
+
+corrdata_pfas <- pfas_eic_pr %>% select(all_of(exposures_short)) %>%
+  rename("PFNA" = "conc_pfna", "PFHxS" = "conc_pfhxs", "PFOS" = "conc_pfos", "PFOA" = "conc_pfoa")
+create_heatplot(corrdata_pfas, c("PFOA", "PFOS", "PFNA", "PFHxS"), "") + ggtitle("") +
+  theme(legend.title = element_blank())
+
+```
+
+In PROTECT, the strongest correlation is between PFOA and PFNA. 
+
+### Correlation between different eicosanoids
+
+Now we will look at correlation between different eicosanoids 
+
+First, in the overall dataset
+
+```{r correlation between eicosanoids in the overall dataset}
+
+# Ensure annotation is sorted by group
+eic_class <- eic_class %>% arrange(group)
+annotation_row_label <- data.frame(group = as.factor(eic_class$group))
+rownames(annotation_row_label) <- eic_class$vars
+
+cor_eic_ls <- cor_eic_func(data = pfas_eic_pr, cohort_variable = "All")
+eic_cor <- cor_eic_ls[[1]] 
+cor_eic_pr <- cor_eic_ls[[2]]
+
+cor_eic_pr_tab <- as.data.frame(cor_eic_pr) 
+cor_eic_pr_tab2 <- cor_eic_pr_tab %>% mutate(var1 = rownames(cor_eic_pr_tab))
+cor_eic_pr_tab2_long <- cor_eic_pr_tab2 %>% pivot_longer(cols = `Bicyclo Prostaglandin E1`:`Linoleic Acid`,
+                                                        names_to = "var2", values_to = "corr") %>%
+  filter(var1 != var2) %>% inner_join(eic_class, by = c("var1" = "vars")) %>%
+  inner_join(eic_class, by = c("var2" = "vars")) %>%
+  mutate(signcorr = sign(corr))
+
+within_path_cor <- cor_eic_pr_tab2_long %>% group_by(group.x, group.y, signcorr) %>% summarise(mean = mean(corr))
+
+```
+
+### Get the most important correlation [eho > abs(0.5)]
+
+```{r choosing the higher correlation}
+
+cor_to_choose_pr <- which(cor_eic_pr >= 0|cor_eic_pr <=0, arr.ind = TRUE)
+
+cor_to_choose_pr2 <- data.frame(
+  Variable1 = rownames(cor_eic_pr)[cor_to_choose_pr[, 1]],
+  Variable2 = colnames(cor_eic_pr)[cor_to_choose_pr[, 2]],
+  Correlation = cor_eic_pr[cor_to_choose_pr]
+)
+
+cor_eic_pr3 <- cor_eic_func2(data = pfas_eic_pr, cohort_variable = "PR", threshold = 0.5)
+
+cor_to_choose_pr2b <- cor_to_choose_pr2 %>% filter(Variable1 != Variable2)
+
+```
+
+Check the distributions of eicosanoids in LC and PR
+
+```{r distributions of eicosanoids in LC and PR}
+
+pfas_eic_pr_long <- pfas_eic_pr %>% select(id, cohort, 
+                                           `13,14-dihydro-15-keto Prostaglandin F2α`:`13,14-dihydro-15-keto Prostaglandin J2`) %>%
+  pivot_longer(cols = `13,14-dihydro-15-keto Prostaglandin F2α`:`13,14-dihydro-15-keto Prostaglandin J2`, 
+               names_to = "vars", values_to = "eic_value") %>%
+  inner_join(eic_class, by = "vars")
+
+eic_hist_fun <- function(group_name) {
+  p <- pfas_eic_pr_long %>%
+    filter(group == group_name) %>%
+    ggplot(aes(x = log(eic_value), fill = group_name)) +
+    geom_density() +
+    facet_wrap(~vars, nrow = 3, scales = "free") +
+    ggtitle(paste(group_name, "group")) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(size = 8) # Adjust the text size for facet labels
+    ) +
+    xlab("log(concentration)")
+  return(p)
+}
+
+
+# Now call the function
+p1eic <- eic_hist_fun(group_name = "Cyclooxygenase")
+p2eic <- eic_hist_fun(group_name = "Cytochrome p450")
+p3eic <- eic_hist_fun(group_name = "Lipoxygenase")
+p4eic <- eic_hist_fun(group_name = "Parent Compound")
+
+p1eic
+p2eic
+p3eic
+p4eic
+
+```
+
+Check eicosanoids with negative values 
+
+```{r check eiocsanoids with negative values}
+summary(pfas_eic_pr)
+
+```
+
+The minimum value for 20HETE is negative. 
+
+Generally, eicosanoid levels are higher in PROTECT as compared to LIFECODES
+
+### Obtain the distributions of eicosanoids in PROTECT
+
+```{r obtaining the distributions of eicosanoids in PROTECT}
+
+eic_summary_results <- lapply(eic_all2, function(col) {
+  eic_col_summary(pfas_eic_pr, col)
+}) %>%
+  bind_rows() %>%
+  select(Eicosanoids, everything()) %>%
+  mutate(MedQ1Q3 = paste0(Median, " (", Q1, ", ", Q3, ")"), vars = Eicosanoids)
+
+# Add class labels
+
+eic_summary_results2 <- eic_summary_results %>% 
+  inner_join(eic_class, by = "vars") %>%
+  select(group, Eicosanoids, Median, Q1, Q3, MedQ1Q3)
+
+# Optional: Save to CSV
+write.csv(eic_summary_results2, "eic_conc_summary_PR.csv", row.names = FALSE)
+
+
+```
+
+I want to now look what % of samples were below the LOD for each eicosanoid
+
+This can be done by first converting eicosanoids data to long-form and then using the LOD to determine the det rate
+
+```{r detection rate of eicosanoids}
+
+pfas_eic_pr_long <- pfas_eic_pr %>% select(id, all_of(eic_all2)) %>%
+  pivot_longer(cols = `13,14-dihydro-15-keto Prostaglandin F2α`:`13,14-dihydro-15-keto Prostaglandin J2`,
+               names_to = "analyte_format", values_to = "conc")
+# pfas_eic_pr_long$analyte <- tolower(pfas_eic_pr_long$analyte)
+
+pfas_eic_pr_long2 <- pfas_eic_pr_long %>% inner_join(lod_eic, by = "analyte_format")
+
+pfas_eic_pr_long2_notNA <- pfas_eic_pr_long2 %>% filter(!is.na(LOD)) %>%
+  mutate(BLOD = ifelse(conc < LOD, 1, 0))
+
+detrate <- pfas_eic_pr_long2_notNA %>% select(analyte_format, BLOD) %>%
+  group_by(analyte_format) %>% summarise(detrate = (1-mean(BLOD, na.rm=TRUE))*100) %>% arrange(desc(detrate))
+
+chk <- pfas_eic_pr %>% select(id, `12(S)-HETE`, `(±)8,9-DHET`, `Prostaglandin E2`, `Leukotriene E4`, 
+                              `Leukotriene C4 methyl ester`,`15(S)-HETE`)
+
+```
+
+These compounds have det rate below 70%: `12(S)-HETE`, `(±)8,9-DHET`, `Prostaglandin E2`, `Leukotriene E4`, 
+                              `Leukotriene C4 methyl ester`,`15(S)-HETE`
+
+### Correlation between PFAS and eicosanoids 
+
+```{r correlation between PFAS and eicosanoids}
+
+annotation_row_label2 <- data.frame(group = as.factor(eic_class$group))
+rownames(annotation_row_label2) <- eic_class$vars
+
+corrdata_pfas_eic <- cor_eic_pfas_func(data = pfas_eic_pr, cohort_variable = "PR",
+                   pfas_vec = exposures_short)
+corrdata_pfas_eic[[2]]
+
+```
+
+### Adjusted models for PFAS and Eicosanoids 
+
+Now we will model the relationship between eicosanoids and PFAS taking into consideration the covariates 
+
+```{r adjusted associations between PFAS and Eicosanoids - PR only}
+
+#For reference
+#exposures_short: "conc_pfoa"  "conc_pfos"  "conc_pfhxs" "conc_pfna" 
+#covars_list_pr: "age" "bmi_prepreg" "as.factor(mat_edu_cat)" "as.factor(ins_cat)" "nullip" "year_t1"
+
+pfas_eic_pr2 <- pfas_eic_pr
+names(pfas_eic_pr2) <- make.names(names(pfas_eic_pr)) #to use when i get error with the current names
+eic_all2b <- make.names(eic_all2) #to use when i get error with the current names
+eic_class2 <- eic_class %>% rename(vars_format = vars)
+eic_class2$vars <- make.names(eic_class2$vars_format)
+
+# Run the function for PR
+results_pr <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                                outcomes = eic_all2b, covariates = covars_list_pr)
+
+results_pr2 <- results_pr %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+#convert results in terms of IQR increase in PFAS
+
+pfas_iqr <- pfas_eic_pr %>%
+  select(all_of(exposures_short)) %>%  # Select PFAS columns based on exposures_short
+  summarise(across(everything(), ~ IQR(log(.x), na.rm = TRUE)))  # Calculate IQR for each column
+
+# Transpose results for better readability
+pfas_iqr <- data.frame(
+  exposure = exposures_short,
+  IQR = as.numeric(t(pfas_iqr))
+)
+
+
+results_pr3 <- results_pr2 %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+
+
+#plot
+
+pfoa_pr<- plot_adj_result(data = results_pr3, pfas = "conc_pfoa") + theme(strip.placement = "outside")
+pfos_pr<- plot_adj_result(data = results_pr3, pfas = "conc_pfos") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), strip.text.y = element_blank())
+pfna_pr<- plot_adj_result(data = results_pr3, pfas = "conc_pfna") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),  strip.text.y = element_blank())
+pfhxs_pr<- plot_adj_result(data = results_pr3, pfas = "conc_pfhxs") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),  strip.text.y = element_blank())
+
+# combine plots using patchwork
+pr_plot <- pfoa_pr | pfos_pr | pfna_pr | pfhxs_pr 
+
+pr_plot 
+
+
+```
+
+### Running model with the same covariates as Suthar et al.
+
+Suthar et al. adjusted for maternal age, education, prepreg BMI, parity, and GA 
+
+```{r run models for eicosanoids in PR with the same covariates as what Suthar et al. did}
+
+covars_list_prb <- c("age", "bmi_prepreg", "as.factor(mat_edu_cat)", "nullip", "ga_t3")
+
+# Run the function for PR
+results_prb <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                                outcomes = eic_all2b, covariates = covars_list_prb)
+
+results_pr2b <- results_prb %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2b) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+
+results_pr3b <- results_pr2b %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+
+
+#plot
+
+pfoa_prb <- plot_adj_result(data = results_pr3b, pfas = "conc_pfoa") + theme(strip.placement = "outside")
+pfos_prb <- plot_adj_result(data = results_pr3b, pfas = "conc_pfos") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), strip.text.y = element_blank())
+pfna_prb <- plot_adj_result(data = results_pr3b, pfas = "conc_pfna") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),  strip.text.y = element_blank())
+pfhxs_prb <- plot_adj_result(data = results_pr3b, pfas = "conc_pfhxs") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),  strip.text.y = element_blank())
+
+# combine plots using patchwork
+pr_plotb <- pfoa_prb | pfos_prb | pfna_prb | pfhxs_prb 
+
+pr_plotb
+
+
+```
+
+Add year to the previous model and rerun
+
+```{r adding year to the suthar et al model}
+
+covars_list_prc <- c("age", "bmi_prepreg", "as.factor(mat_edu_cat)", "nullip", "ga_t3", "as.numeric(year_t1)")
+
+# Run the function for PR
+results_prc <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                               outcomes = eic_all2b, covariates = covars_list_prc)
+
+results_pr2c <- results_prc %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2c) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+
+results_pr3c <- results_pr2c %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+
+
+#plot
+
+pfoa_prc <- plot_adj_result(data = results_pr3c, pfas = "conc_pfoa") + theme(strip.placement = "outside")
+pfos_prc <- plot_adj_result(data = results_pr3c, pfas = "conc_pfos") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), strip.text.y = element_blank())
+pfna_prc <- plot_adj_result(data = results_pr3c, pfas = "conc_pfna") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),  strip.text.y = element_blank())
+pfhxs_prc <- plot_adj_result(data = results_pr3c, pfas = "conc_pfhxs") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),  strip.text.y = element_blank())
+
+# combine plots using patchwork
+pr_plotc <- pfoa_prc | pfos_prc | pfna_prc | pfhxs_prc 
+
+pr_plotc
+
+```
+
+Verifying the results from the function
+
+```{r verifying the results from the function}
+
+covars_list_pr
+covars_list_prb
+covars_list_prc
+
+med_gat3 <- median(pfas_eic_pr2$ga_t3, na.rm = TRUE)
+
+pfas_eic_pr2 <- pfas_eic_pr2 %>% mutate(ga_t3_imp = ifelse(is.na(ga_t3), med_gat3, ga_t3))
+
+chk_eic <- lm(log(Linoleic.Acid) ~ log(conc_pfos) + age + bmi_prepreg + as.factor(mat_edu_cat) + 
+                as.factor(ins_cat) + nullip + year_t1, data = pfas_eic_pr2)
+broom::tidy(chk_eic)
+car::vif(chk_eic)
+
+
+chk_eicb0 <- lm(log(Linoleic.Acid) ~ log(conc_pfos) + age + bmi_prepreg + as.factor(mat_edu_cat) + 
+                  nullip + year_t1, data = pfas_eic_pr2)
+broom::tidy(chk_eicb0)
+car::vif(chk_eicb0)
+
+
+chk_eicb <- lm(log(Linoleic.Acid) ~ log(conc_pfos) + age + bmi_prepreg + as.factor(mat_edu_cat) + 
+                nullip + ga_t3_imp, data = pfas_eic_pr2)
+broom::tidy(chk_eicb)
+car::vif(chk_eicb)
+
+
+chk_eicc <- lm(log(Linoleic.Acid) ~ log(conc_pfos) + age + bmi_prepreg + as.factor(mat_edu_cat) + 
+                nullip + ga_t3 + year_t1, data = pfas_eic_pr2)
+broom::tidy(chk_eicc)
+car::vif(chk_eicc)
+
+#residual plots
+
+plot(chk_eic)
+plot(chk_eicb)
+plot(chk_eicc)
+
+
+chk_eic2 <- lm(log(X.α..Linolenic.Acid) ~ log(conc_pfos) + age + bmi_prepreg + as.factor(mat_edu_cat) + 
+                as.factor(ins_cat) + nullip + year_t1, data = pfas_eic_pr2)
+broom::tidy(chk_eic2)
+
+
+chk_eicb2 <- lm(log(X.α..Linolenic.Acid) ~ log(conc_pfos) + age + bmi_prepreg + as.factor(mat_edu_cat) + 
+                nullip + ga_t3, data = pfas_eic_pr2)
+broom::tidy(chk_eicb2)
+
+
+chk_eicc2 <- lm(log(X.α..Linolenic.Acid) ~ log(conc_pfos) + age + bmi_prepreg + as.factor(mat_edu_cat) + 
+                nullip + ga_t3 + year_t1, data = pfas_eic_pr2)
+broom::tidy(chk_eicc2)
+
+
+plot(chk_eic2)
+plot(chk_eicb2)
+plot(chk_eicc2)
+```
+
+The results look fine, per manual verification. Also adjusting for year provides a better model fit. I think we should adjust for the year because of how importantly it affects the results. 
+
+Check the trend for some eicosanoids with year 
+
+### Outcome trends with year
+
+```{r look at the trend of outcomes with year}
+
+
+# Reshape the data for plotting
+heatmap_data <- pfas_eic_pr2 %>%
+  select(all_of(eic_all2b), year_t1) %>%  # Select eicosanoids and year
+  group_by(year_t1) %>%                    # Group by year
+  summarise(across(everything(), function (x) median(log(x), na.rm = TRUE))) %>%  # Calculate mean for each eicosanoid by year
+  pivot_longer(-year_t1, names_to = "Eicosanoid", values_to = "Median")  # Reshape to long format
+
+# Plot the heatmap
+heatmap_plot <- ggplot(heatmap_data, aes(x = factor(year_t1), y = Eicosanoid, fill = Median)) +
+  geom_tile(color = "white") +  
+  scale_fill_gradient() +  # Gradient fill
+  labs(x = "Year", y = "Eicosanoid", fill = "Median", title = "Eicosanoids Levels by Year") +
+  theme_minimal() +  # Minimal theme
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels for readability
+    axis.text.y = element_text(size = 8),              # Adjust y-axis text size
+    strip.text = element_text(size = 10)               # Adjust facet strip text size if needed
+  )
+
+# Print the plot
+print(heatmap_plot)
+
+
+#Also plot a lineplot
+lineplot <- ggplot(heatmap_data, aes(x = as.factor(year_t1), y = Median, color = Eicosanoid, group = Eicosanoid)) +
+  geom_line() +  # Add lines
+  geom_point(size = 2) +  # Add points for each data value
+  labs(
+    x = "Year",
+    y = "Mean Level",
+    color = "Eicosanoid",
+    title = "Trends in Eicosanoids Levels by Year"
+  ) +
+  theme_minimal() +  # Minimal theme
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels for readability
+    legend.position = "bottom",                          # Position legend to the right
+    legend.text = element_text(size = 8),               # Adjust legend text size
+    legend.title = element_text(size = 10),             # Adjust legend title size
+    axis.text.y = element_text(size = 8)                # Adjust y-axis text size
+  )
+
+print(lineplot)
+
+```
+
+We do not see a consistent trend in eicosanoids
+
+
+### Analysis with categorized exposures for PFOA and PFHxS
+
+```{r categorized PFOA and PFHxS exposures}
+
+pfas_eic_pr2 <- pfas_eic_pr2 %>% 
+  mutate(alod_pfoa = 1 - blod_pfoa, alod_pfhxs = 1 - blod_pfhxs, alod_pfua = 1-blod_pfua)
+
+exposures_short_cat <- c("alod_pfoa", "alod_pfhxs", "alod_pfua")
+
+
+# Run the function for PR
+results_pr_cat <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short_cat, 
+                                outcomes = eic_all2b, covariates = covars_list_pr)
+
+results_pr_cat2 <- results_pr_cat %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr_cat2) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+#convert results in terms of IQR increase in PFAS
+
+results_pr_cat3 <- results_pr_cat2 %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  left_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = ifelse(substr(exposure,1,4) == "alod", 
+                           (exp(estimate_old)-1)*100, (exp(estimate_old*IQR)-1)*100), 
+         conf.low = ifelse(substr(exposure,1,4) == "alod",
+                           (exp(conf.low_old)-1)*100, (exp(conf.low_old*IQR)-1)*100),
+         conf.high = ifelse(substr(exposure,1,4) == "alod",
+                            (exp(conf.high_old)-1)*100, (exp(conf.high_old*IQR)-1)*100))
+
+
+#plot
+
+pfoa_pr_cat <- plot_adj_result(data = results_pr_cat3, pfas = "alod_pfoa") + theme(strip.placement = "outside")
+pfhxs_pr_cat <- plot_adj_result(data = results_pr_cat3, pfas = "alod_pfhxs") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(), strip.text.y = element_blank())
+pfua_pr_cat <- plot_adj_result(data = results_pr_cat3, pfas = "alod_pfua") + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),  strip.text.y = element_blank())
+
+# combine plots using patchwork
+pr_plot_cat <- pfoa_pr_cat | pfhxs_pr_cat | pfua_pr_cat
+
+pr_plot_cat
+  
+```
+
+
+### Run models without education as a covariate
+
+```{r running models without education as a covariate}
+#Visualize missingness of all covariates
+
+visdat::vis_miss(pfas_eic_pr2 %>% select(id, age, bmi_prepreg, mat_edu_cat, ins_cat, nullip,
+                                         year_t1, ga_t3))
+
+
+covars_list_pr_noed <- setdiff(covars_list_pr, "as.factor(mat_edu_cat)")
+
+
+# Run the function for PR
+results_pr_noed <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                                outcomes = eic_all2b, covariates = covars_list_pr_noed)
+
+results_pr2_noed <- results_pr_noed %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2_noed) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+#convert results in terms of IQR increase in PFAS
+
+results_pr3_noed <- results_pr2_noed %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+results_pr3_noed <- results_pr3_noed %>% mutate(Group2 = "No edu")
+results_pr3_chk <- results_pr3 %>% mutate(Group2 = "All primary covariates")
+
+results_pr3_comp <- rbind.data.frame(results_pr3_chk, results_pr3_noed)
+
+#Now plot the comparisons
+
+results_pr3_comp %>%
+    ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = outcome_format, col = Group2)) +
+    geom_pointrange(position = position_dodge(width = 0.8)) +
+    theme(legend.position = "bottom") +
+    geom_vline(xintercept = 0) +
+    xlab("") +
+    facet_grid(. ~ exposure, scales = "free_x") +  # Facet by group, switch facet labels to y-axis
+    theme(strip.placement = "outside", strip.text.y = element_text(angle = 0),
+          axis.title.y = element_blank()) 
+
+
+```
+
+Maybe I should do this with all covariates. I will run without insurance now
+
+### Run models without insurance as a covariate
+
+```{r running models without insurance as a covariate}
+
+covars_list_pr_noins <- setdiff(covars_list_pr, "as.factor(ins_cat)")
+
+
+# Run the function for PR
+results_pr_noins <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                                   outcomes = eic_all2b, covariates = covars_list_pr_noins)
+
+results_pr2_noins <- results_pr_noins %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2_noins) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+#convert results in terms of IQR increase in PFAS
+
+results_pr3_noins <- results_pr2_noins %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+results_pr3_noins <- results_pr3_noins %>% mutate(Group2 = "No ins")
+
+results_pr3_comp2 <- rbind.data.frame(results_pr3_chk, results_pr3_noins)
+
+#Now plot the comparisons
+
+results_pr3_comp2 %>%
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = outcome_format, col = Group2)) +
+  geom_pointrange(position = position_dodge(width = 0.8)) +
+  theme(legend.position = "bottom") +
+  geom_vline(xintercept = 0) +
+  xlab("") +
+  facet_grid(. ~ exposure, scales = "free_x") +  # Facet by group, switch facet labels to y-axis
+  theme(strip.placement = "outside", strip.text.y = element_text(angle = 0),
+        axis.title.y = element_blank()) 
+
+
+```
+
+### Run models without age as a covariate
+
+```{r running models without age as a covariate}
+
+covars_list_pr_noage <- setdiff(covars_list_pr, "age")
+
+
+# Run the function for PR
+results_pr_noage <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                                   outcomes = eic_all2b, covariates = covars_list_pr_noage)
+
+results_pr2_noage <- results_pr_noage %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2_noage) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+#convert results in terms of IQR increase in PFAS
+
+results_pr3_noage <- results_pr2_noage %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+results_pr3_noage <- results_pr3_noage %>% mutate(Group2 = "No age")
+
+results_pr3_comp3 <- rbind.data.frame(results_pr3_chk, results_pr3_noage)
+
+#Now plot the comparisons
+
+results_pr3_comp3 %>%
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = outcome_format, col = Group2)) +
+  geom_pointrange(position = position_dodge(width = 0.8)) +
+  theme(legend.position = "bottom") +
+  geom_vline(xintercept = 0) +
+  xlab("") +
+  facet_grid(. ~ exposure, scales = "free_x") +  # Facet by group, switch facet labels to y-axis
+  theme(strip.placement = "outside", strip.text.y = element_text(angle = 0),
+        axis.title.y = element_blank()) 
+
+```
+
+
+### Run models without nullip as a covariate
+
+```{r running models without nullip as a covariate}
+
+covars_list_pr_nonullip <- setdiff(covars_list_pr, "nullip")
+
+
+# Run the function for PR
+results_pr_nonullip <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                                   outcomes = eic_all2b, covariates = covars_list_pr_nonullip)
+
+results_pr2_nonullip <- results_pr_nonullip %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2_nonullip) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+#convert results in terms of IQR increase in PFAS
+
+results_pr3_nonullip <- results_pr2_nonullip %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+results_pr3_nonullip <- results_pr3_nonullip %>% mutate(Group2 = "No nullip")
+
+results_pr3_comp4 <- rbind.data.frame(results_pr3_chk, results_pr3_nonullip)
+
+#Now plot the comparisons
+
+results_pr3_comp4 %>%
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = outcome_format, col = Group2)) +
+  geom_pointrange(position = position_dodge(width = 0.8)) +
+  theme(legend.position = "bottom") +
+  geom_vline(xintercept = 0) +
+  xlab("") +
+  facet_grid(. ~ exposure, scales = "free_x") +  # Facet by group, switch facet labels to y-axis
+  theme(strip.placement = "outside", strip.text.y = element_text(angle = 0),
+        axis.title.y = element_blank()) 
+
+```
+
+### Run models without year as a covariate
+
+```{r running models without year as a covariate}
+
+covars_list_pr_noyear <- setdiff(covars_list_pr, "year_t1")
+
+
+# Run the function for PR
+results_pr_noyear <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                                   outcomes = eic_all2b, covariates = covars_list_pr_noyear)
+
+results_pr2_noyear <- results_pr_noyear %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2_noyear) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+#convert results in terms of IQR increase in PFAS
+
+results_pr3_noyear <- results_pr2_noyear %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+results_pr3_noyear <- results_pr3_noyear %>% mutate(Group2 = "No year")
+
+results_pr3_comp5 <- rbind.data.frame(results_pr3_chk, results_pr3_noyear)
+
+#Now plot the comparisons
+
+results_pr3_comp5 %>%
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = outcome_format, col = Group2)) +
+  geom_pointrange(position = position_dodge(width = 0.8)) +
+  theme(legend.position = "bottom") +
+  geom_vline(xintercept = 0) +
+  xlab("") +
+  facet_grid(. ~ exposure, scales = "free_x") +  # Facet by group, switch facet labels to y-axis
+  theme(strip.placement = "outside", strip.text.y = element_text(angle = 0),
+        axis.title.y = element_blank()) 
+
+```
+
+
+### Run models with ga_t3 as a covariate
+
+```{r running models with ga_t3 as a covariate}
+
+covars_list_pr_gat3_added <- c(covars_list_pr, "ga_t3_imp")
+
+
+# Run the function for PR
+results_pr_gat3_added <- pfas_eic_adjmod(data = pfas_eic_pr2, exposures = exposures_short, 
+                                   outcomes = eic_all2b, covariates = covars_list_pr_gat3_added)
+
+results_pr2_gat3_added <- results_pr_gat3_added %>% mutate(vars = Outcome) %>%
+  inner_join(eic_class2, by = "vars") %>% select(-vars)
+
+names(results_pr2_gat3_added) <- c("exposure", "outcome", "estimate", "conf.low", "conf.high", "pval", "outcome_format", "group")
+
+#convert results in terms of IQR increase in PFAS
+
+results_pr3_gat3_added <- results_pr2_gat3_added %>%
+  rename(estimate_old = estimate, conf.low_old = conf.low, conf.high_old = conf.high) %>%
+  inner_join(pfas_iqr, by = "exposure") %>%
+  mutate(estimate = (exp(estimate_old*IQR)-1)*100, 
+         conf.low = (exp(conf.low_old*IQR)-1)*100, 
+         conf.high = (exp(conf.high_old*IQR)-1)*100)
+results_pr3_gat3_added <- results_pr3_gat3_added %>% mutate(Group2 = "Yes GA_t3")
+
+results_pr3_comp6 <- rbind.data.frame(results_pr3_chk, results_pr3_gat3_added)
+
+#Now plot the comparisons
+
+results_pr3_comp6 %>%
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = outcome_format, col = Group2)) +
+  geom_pointrange(position = position_dodge(width = 0.8)) +
+  theme(legend.position = "bottom") +
+  geom_vline(xintercept = 0) +
+  xlab("") +
+  facet_grid(group ~ exposure, scales = "free") +  # Facet by group, switch facet labels to y-axis
+  theme(strip.placement = "outside", strip.text.y = element_text(angle = 0),
+        axis.title.y = element_blank()) 
+```
+
+### Now plot results from all models together
+
+Now we will want to plot results from all models 
+
+```{r plot results from all models together}
+
+results_pr3_comp7 <- rbind.data.frame(results_pr3_chk, results_pr3_noed, results_pr3_noins, 
+                                      results_pr3_noage, results_pr3_nonullip, results_pr3_noyear,
+                                      results_pr3_gat3_added)
+
+
+plot_allcovarscomp <- function(data, groupvar){
+data %>% filter(group == groupvar) %>%
+  ggplot(aes(x = estimate, xmin = conf.low, xmax = conf.high, y = outcome_format, col = Group2)) +
+  geom_pointrange(position = position_dodge(width = 0.8)) +
+  theme(legend.position = "bottom") +
+  geom_vline(xintercept = 0) +
+  xlab(paste0(groupvar, "group")) +
+  facet_grid(.~ exposure, scales = "free") +  # Facet by group, switch facet labels to y-axis
+  theme(strip.placement = "outside", strip.text.y = element_text(angle = 0),
+        axis.title.y = element_blank()) 
+}
+
+plot_allcovarscomp(data = results_pr3_comp7, groupvar = "Cyclooxygenase")
+plot_allcovarscomp(data = results_pr3_comp7, groupvar = "Cytochrome p450")
+plot_allcovarscomp(data = results_pr3_comp7, groupvar = "Lipoxygenase")
+plot_allcovarscomp(data = results_pr3_comp7, groupvar = "Parent Compound")
+
+
+
+```
+No covariates really move the estimate other than year of enrollment.
+
+
+### Run PCA on eicosanoids in each cohort
+
+```{r PCA on eicosanoids in PR}
+
+eic_pr_only <- pfas_eic_pr2 %>% select(id, all_of(eic_all2b)) 
+
+#Impute missing data using median
+
+med_lte4 <- median(eic_pr_only$Leukotriene.E4, na.rm = TRUE)
+med_ltc4.me <- median(eic_pr_only$Leukotriene.C4.methyl.ester, na.rm = TRUE)
+med_hete20 <- median(eic_pr_only$X20.S..HETE, na.rm = TRUE)
+
+eic_pr_only <- eic_pr_only %>%
+  mutate(X20.S..HETE = ifelse(X20.S..HETE < 0, NA, X20.S..HETE)) %>%
+  mutate(Leukotriene.E4 = ifelse(is.na(Leukotriene.E4), med_lte4, Leukotriene.E4),
+         Leukotriene.C4.methyl.ester = ifelse(is.na(Leukotriene.C4.methyl.ester), med_ltc4.me,
+                                              Leukotriene.C4.methyl.ester),
+         X20.S..HETE = ifelse(is.na(X20.S..HETE), med_hete20, X20.S..HETE))
+
+
+# Exclude the 'id' column for transformation
+eic_data <- eic_pr_only[, -1]
+
+# Apply log transformation (adding a small constant to avoid log(0))
+log_transformed <- log(eic_data)
+
+# Standardize the data (mean = 0, variance = 1)
+scaled_data <- scale(log_transformed)
+
+# Perform PCA
+pca_result <- prcomp(scaled_data, center = FALSE, scale. = FALSE)
+
+# View PCA summary
+summary(pca_result)
+
+# Scree plot to visualize variance explained
+screeplot(pca_result, type = "lines", main = "Scree Plot")
+
+# Biplot for visualization
+biplot(pca_result, scale = 0)
+
+# Get PCA loadings and scores
+pca_loadings <- pca_result$rotation
+pca_scores <- pca_result$x
+
+# Inspect the first few PCA loadings
+head(pca_loadings)
+
+# Inspect the first few PCA scores
+head(pca_scores)
+
+```
+
+We need 11 PCs to explain at least 70% variability, so maybe I will not do this analysis. 
+
+### Correlation between PFAS and oxidative stress or inflammatory biomarkers
+
+Look at the correlation between PFAS and OS/inflammatory biomarkers in PROTECT
+
+```{r correlation between eicosanoids and OS in PR}
+
+os_pr <- read.csv("os_inf_protect.csv") %>% 
+  select(id, visit, method_ind, X_8_IsoM, PGF2a, X_8_Iso) %>%
+  pivot_wider(names_from = visit, values_from = c(X_8_IsoM, PGF2a, X_8_Iso))
+
+pfas_eic_pr_os <- pfas_eic_pr %>% left_join(os_pr, by = "id") %>% distinct()
+#563 because for 22 participants, we have OS data from both method1 and method 2 as shown below:
+
+
+os_pr_id <- pfas_eic_pr_os %>% group_by(id) %>% tally() %>% filter(n == 2)
+os_pr_id2 <- os_pr_id %>% inner_join(pfas_eic_pr_os, by = "id") %>%
+  select(id, method_ind, all_of(os_pr_list))
+
+
+#Look at the correlation between eicosanoids and oxidative stress markers
+
+os_pr_list <- c("X_8_IsoM_2", "X_8_IsoM_1", "X_8_IsoM_3", "PGF2a_2", "PGF2a_1", "PGF2a_3",
+                "X_8_Iso_2",  "X_8_Iso_1",  "X_8_Iso_3")
+
+
+cor_eic_osinf_func(data = pfas_eic_pr_os, cohort_variable = "PR", osinf = os_pr_list) 
+
+
+```
+
+In general, we see positive correlation with pro-inflammatory eicosanoids and negative correlation with
+anti-inflammatory eicosanoids. 
+
+### Select only the significant results from the first model
+
+```{r selecting only the significant results}
+
+sig_pfas_eic <-  results_pr3 %>% 
+  filter(pval <= 0.05) %>% 
+  mutate(sign = ifelse(estimate_old < 0, "Neg", "Pos")) %>%
+  select(exposure, outcome, sign) %>%
+  pivot_wider(names_from = exposure, values_from = sign) %>% 
+  mutate(across(conc_pfoa:conc_pfna, ~ ifelse(is.na(.x), "", .x))) %>% 
+  mutate(sign2 = paste0(conc_pfoa, conc_pfhxs, conc_pfos, conc_pfna)) %>%
+  mutate(sign3 = substr(sign2, 1,3)) 
+
+sig_pfas_eic_pr <- sig_pfas_eic %>% select(outcome, sign3) %>%
+  rename("metab1" = "outcome", "effect sign" = "sign3")
+write.csv(sig_pfas_eic_pr, "pfas_eic_pr_sigeffects.csv")
+
+```
+
+
+
+### Multiple correction of p-values
+
+I will apply multiple correction for each PFAS 
+
+```{r p-values after multiple correction}
+
+#PR
+
+results_pr3a<- results_pr3 %>% filter(exposure == "conc_pfos") %>%
+  mutate(ad_pval = stats::p.adjust(pval, method = "BH"))
+
+
+results_pr3b <- results_pr3 %>% filter(exposure == "conc_pfna") %>%
+  mutate(ad_pval = stats::p.adjust(pval, method = "BH"))
+
+
+results_pr3c<- results_pr3 %>% filter(exposure == "conc_pfhxs") %>%
+  mutate(ad_pval = stats::p.adjust(pval, method = "BH"))
+
+
+results_pr3d <- results_pr3 %>% filter(exposure == "conc_pfna") %>%
+  mutate(ad_pval = stats::p.adjust(pval, method = "BH"))
+
+```
+
+
+
+
+
+
+
